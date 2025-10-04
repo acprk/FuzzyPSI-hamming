@@ -1,0 +1,440 @@
+#include <iostream>
+#include <vector>
+#include <set>
+#include <map>
+#include <memory>
+#include <sstream>
+#include <algorithm>
+
+// SEAL 库
+#include <seal/seal.h>
+
+// cryptoTools 库
+#include "cryptoTools/Common/Defines.h"
+#include "cryptoTools/Common/block.h"
+#include "cryptoTools/Crypto/PRNG.h"
+#include "cryptoTools/Network/Channel.h"
+#include "cryptoTools/Network/Session.h"
+#include "cryptoTools/Network/IOService.h"
+
+// 项目头文件
+#include "band_okvs.h"
+#include "elsh.h"
+#include "utils.h"
+
+using namespace osuCrypto;
+using namespace seal;
+using namespace band_okvs;
+
+class FPSIReceiver {
+public:
+    FPSIReceiver(int n, int d, int delta, int L)
+        : n_(n), d_(d), delta_(delta), L_(L) {
+        
+        prng_.SetSeed(block(987654, 321098));
+        elsh_ = std::make_unique<ELSHFmap>(d, delta, L);
+        initializeSEAL();
+    }
+    
+    void initializeSEAL() {
+        EncryptionParameters parms(scheme_type::bfv);
+        size_t poly_modulus_degree = 8192;
+        parms.set_poly_modulus_degree(poly_modulus_degree);
+        parms.set_coeff_modulus(CoeffModulus::BFVDefault(poly_modulus_degree));
+        parms.set_plain_modulus(PlainModulus::Batching(poly_modulus_degree, 20));
+        
+        context_ = std::make_shared<SEALContext>(parms);
+        
+        KeyGenerator keygen(*context_);
+        secret_key_ = keygen.secret_key();
+        keygen.create_public_key(public_key_);
+        
+        encryptor_ = std::make_unique<Encryptor>(*context_, public_key_);
+        decryptor_ = std::make_unique<Decryptor>(*context_, secret_key_);
+        evaluator_ = std::make_unique<Evaluator>(*context_);
+        
+        std::cout << "Receiver: SEAL 参数初始化完成" << std::endl;
+        std::cout << "  多项式模数度: " << poly_modulus_degree << std::endl;
+    }
+    
+    void generateData() {
+        std::cout << "Receiver: 生成 " << n_ << " 个 " << d_ << " 维向量..." << std::endl;
+        
+        W_.resize(n_);
+        for (int i = 0; i < n_; ++i) {
+            W_[i] = utils::generateRandomBinaryVector(d_, prng_);
+        }
+        
+        std::cout << "Receiver: 数据生成完成" << std::endl;
+    }
+    
+    void runOffline(osuCrypto::Channel& chl) {
+        std::cout << "\n========== Receiver: 离线阶段开始 ==========" << std::endl;
+        
+        Timer timer;
+        timer.start();
+        
+        std::cout << "Receiver: 计算 E-LSH ID..." << std::endl;
+        ID_W_ = elsh_->computeIDBatch(W_);
+        
+        uint64_t id_count = 0;
+        for (const auto& ids : ID_W_) {
+            id_count += ids.size();
+        }
+        std::cout << "Receiver: 生成了 " << id_count << " 个 ID" << std::endl;
+        
+        std::cout << "Receiver: 构造 OKVS 输入..." << std::endl;
+        
+        std::vector<block> okvs_keys;
+        std::vector<block> okvs_values;
+        
+        for (int i = 0; i < n_; ++i) {
+            for (const auto& id_str : ID_W_[i]) {
+                std::hash<std::string> hasher;
+                uint64_t hash_val = hasher(id_str);
+                block key(hash_val, i);
+                block value = utils::vectorToBlock(W_[i], 0);
+                
+                okvs_keys.push_back(key);
+                okvs_values.push_back(value);
+            }
+        }
+        
+        std::cout << "Receiver: OKVS 输入大小 = " << okvs_keys.size() << std::endl;
+        std::cout << "Receiver: 执行 OKVS 编码..." << std::endl;
+        
+        double epsilon = 0.05;
+        int m_okvs = static_cast<int>((1 + epsilon) * okvs_keys.size());
+        int band_length = okvsBandLength(okvs_keys.size());
+        
+        std::cout << "Receiver: OKVS 参数 - m=" << m_okvs 
+                  << ", band_length=" << band_length << std::endl;
+        
+        BandOkvs okvs;
+        okvs.Init(okvs_keys.size(), m_okvs, band_length, 
+                  block(prng_.get<uint64_t>(), prng_.get<uint64_t>()));
+        
+        okvs_encoded_.resize(okvs.Size());
+        
+        if (!okvs.Encode(okvs_keys.data(), okvs_values.data(), okvs_encoded_.data())) {
+            std::cerr << "Receiver: OKVS 编码失败!" << std::endl;
+            throw std::runtime_error("OKVS encoding failed");
+        }
+        
+        std::cout << "Receiver: OKVS 编码完成, 输出大小 = " 
+                  << okvs_encoded_.size() << std::endl;
+        std::cout << "Receiver: 发送 OKVS 编码和公钥到 Sender..." << std::endl;
+        
+        // 发送 OKVS 编码
+        uint64_t okvs_size = okvs_encoded_.size();
+        chl.send(okvs_size);
+        chl.send(okvs_encoded_.data(), okvs_size);
+        offline_comm_.addSent(sizeof(uint64_t) + okvs_size * sizeof(block));
+        
+        std::cout << "Receiver: OKVS 发送完成 (" 
+                  << okvs_size * sizeof(block) / (1024.0 * 1024.0) << " MB)" << std::endl;
+        
+        // 发送公钥
+        std::stringstream pk_stream;
+        public_key_.save(pk_stream);
+        std::string pk_str = pk_stream.str();
+        chl.send(pk_str);
+        offline_comm_.addSent(pk_str.size());
+        
+        std::cout << "Receiver: 公钥发送完成 (" 
+                  << pk_str.size() / (1024.0 * 1024.0) << " MB)" << std::endl;
+        
+        timer.stop();
+        offline_time_ = timer.getElapsedSeconds();
+        
+        std::cout << "Receiver: 离线阶段完成" << std::endl;
+        std::cout << "  时间: " << offline_time_ << " 秒" << std::endl;
+        offline_comm_.print("离线");
+    }
+    
+    void runOnline(osuCrypto::Channel& chl) {
+        std::cout << "\n========== Receiver: 在线阶段开始 ==========" << std::endl;
+        
+        Timer timer;
+        timer.start();
+        
+        // 接收 Sender 的实际数据集大小
+        int m_sender;
+        chl.recv(m_sender);
+        
+        int rate_s = L_;
+        
+        std::cout << "Receiver: Sender 数据集大小 = " << m_sender << std::endl;
+        std::cout << "Receiver: 接收 Sender 的数据..." << std::endl;
+        std::cout << "Receiver: 预期接收 " << m_sender << " * " << rate_s 
+                  << " = " << m_sender * rate_s << " 个消息" << std::endl;
+        
+        int total_received = 0;
+        matched_sender_indices_.clear();
+        match_pairs_.clear();
+        
+        // 为每个 Sender 向量接收数据并匹配
+        for (int j = 0; j < m_sender; ++j) {
+            if (j % 100 == 0 && j > 0) {
+                std::cout << "Receiver: 处理进度 " << j << "/" << m_sender << std::endl;
+            }
+            
+            bool found_match = false;
+            
+            for (int ell = 0; ell < rate_s; ++ell) {
+                // 接收 u 向量
+                std::vector<uint8_t> u(d_);
+                chl.recv(u.data(), d_);
+                online_comm_.addReceived(d_);
+                total_received++;
+                
+                // 简化实现：直接对比汉明距离
+                // 完整实现需要：解密、XOR恢复、验证
+                for (int i = 0; i < n_; ++i) {
+                    int dist = utils::hammingDistance(u, W_[i]);
+                    
+                    if (dist <= delta_) {
+                        matched_sender_indices_.insert(j);
+                        match_pairs_.push_back({i, j});
+                        found_match = true;
+                        break;
+                    }
+                }
+                
+                if (found_match) {
+                    break;
+                }
+            }
+        }
+        
+        int matches_found = matched_sender_indices_.size();
+        
+        std::cout << "Receiver: 共接收 " << total_received << " 个消息" << std::endl;
+        std::cout << "Receiver: 找到 " << matches_found << " 个匹配的 Sender 向量" << std::endl;
+        
+        // 输出详细匹配信息（前20个）
+        if (!match_pairs_.empty()) {
+            std::cout << "\n协议输出的前 20 个匹配对:" << std::endl;
+            int display_count = std::min(20, (int)match_pairs_.size());
+            for (int i = 0; i < display_count; ++i) {
+                auto [r_idx, s_idx] = match_pairs_[i];
+                std::cout << "  R[" << r_idx << "] <-> S[" << s_idx << "]" << std::endl;
+            }
+        }
+        
+        timer.stop();
+        online_time_ = timer.getElapsedSeconds();
+        
+        std::cout << "Receiver: 在线阶段完成" << std::endl;
+        std::cout << "  时间: " << online_time_ << " 秒" << std::endl;
+        online_comm_.print("在线");
+    }
+    
+    void verifyWithPlaintext(osuCrypto::Channel& chl) {
+        std::cout << "\n========== 明文验证阶段 ==========" << std::endl;
+        
+        // 接收 Sender 的原始数据
+        int m_sender;
+        chl.recv(m_sender);
+        
+        std::cout << "验证: 接收 Sender 的 " << m_sender << " 个明文向量..." << std::endl;
+        
+        std::vector<std::vector<uint8_t>> sender_data(m_sender);
+        for (int j = 0; j < m_sender; ++j) {
+            sender_data[j].resize(d_);
+            chl.recv(sender_data[j].data(), d_);
+        }
+        
+        // 暴力计算真实交集
+        std::cout << "验证: 计算真实交集..." << std::endl;
+        std::set<int> ground_truth_matches;
+        std::vector<std::pair<int, int>> ground_truth_pairs;
+        
+        for (int i = 0; i < n_; ++i) {
+            for (int j = 0; j < m_sender; ++j) {
+                int dist = utils::hammingDistance(W_[i], sender_data[j]);
+                if (dist <= delta_) {
+                    ground_truth_matches.insert(j);
+                    ground_truth_pairs.push_back({i, j});
+                }
+            }
+        }
+        
+        int ground_truth_count = ground_truth_matches.size();
+        int protocol_count = matched_sender_indices_.size();
+        
+        std::cout << "\n========== 验证结果 ==========" << std::endl;
+        std::cout << "协议输出的匹配数: " << protocol_count << std::endl;
+        std::cout << "明文计算的匹配数: " << ground_truth_count << std::endl;
+        
+        // 计算准确率
+        std::set<int> intersection;
+        std::set_intersection(
+            matched_sender_indices_.begin(), matched_sender_indices_.end(),
+            ground_truth_matches.begin(), ground_truth_matches.end(),
+            std::inserter(intersection, intersection.begin())
+        );
+        
+        int correct = intersection.size();
+        int false_positive = protocol_count - correct;
+        int false_negative = ground_truth_count - correct;
+        
+        std::cout << "\n正确匹配: " << correct << std::endl;
+        std::cout << "误报 (False Positive): " << false_positive << std::endl;
+        std::cout << "漏报 (False Negative): " << false_negative << std::endl;
+        
+        if (protocol_count > 0) {
+            double precision = (double)correct / protocol_count;
+            std::cout << "精确率 (Precision): " << (precision * 100) << "%" << std::endl;
+        }
+        
+        if (ground_truth_count > 0) {
+            double recall = (double)correct / ground_truth_count;
+            std::cout << "召回率 (Recall): " << (recall * 100) << "%" << std::endl;
+        }
+        
+        if (correct == ground_truth_count && false_positive == 0) {
+            std::cout << "\n✓ 验证通过：协议输出完全正确！" << std::endl;
+        } else {
+            std::cout << "\n✗ 验证失败：协议输出与明文计算不一致" << std::endl;
+        }
+        
+        // 显示详细对比（前10个）
+        if (ground_truth_count > 0) {
+            std::cout << "\n明文计算的前 10 个匹配对 (汉明距离):" << std::endl;
+            for (int i = 0; i < std::min(10, (int)ground_truth_pairs.size()); ++i) {
+                auto [r_idx, s_idx] = ground_truth_pairs[i];
+                int dist = utils::hammingDistance(W_[r_idx], sender_data[s_idx]);
+                std::cout << "  R[" << r_idx << "] <-> S[" << s_idx 
+                          << "], 距离=" << dist << std::endl;
+            }
+        }
+    }
+    
+    void printStatistics() {
+        std::cout << "\n========================================" << std::endl;
+        std::cout << "Receiver 统计信息" << std::endl;
+        std::cout << "========================================" << std::endl;
+        std::cout << "参数: n=" << n_ << ", d=" << d_ 
+                  << ", δ=" << delta_ << ", L=" << L_ << std::endl;
+        std::cout << std::endl;
+        
+        std::cout << "离线阶段:" << std::endl;
+        std::cout << "  时间: " << offline_time_ << " 秒" << std::endl;
+        std::cout << "  通信: " << offline_comm_.getTotalMegabytes() << " MB" << std::endl;
+        std::cout << std::endl;
+        
+        std::cout << "在线阶段:" << std::endl;
+        std::cout << "  时间: " << online_time_ << " 秒" << std::endl;
+        std::cout << "  通信: " << online_comm_.getTotalMegabytes() << " MB" << std::endl;
+        std::cout << std::endl;
+        
+        std::cout << "总计:" << std::endl;
+        std::cout << "  时间: " << (offline_time_ + online_time_) << " 秒" << std::endl;
+        std::cout << "  通信: " 
+                  << (offline_comm_.getTotalMegabytes() + online_comm_.getTotalMegabytes()) 
+                  << " MB" << std::endl;
+        std::cout << "========================================" << std::endl;
+        
+        utils::saveStats("fpsi_stats.txt", "Receiver", offline_time_, online_time_,
+                        offline_comm_, online_comm_, n_, d_, delta_);
+    }
+
+private:
+    int okvsBandLength(int n) {
+        if (n <= (1 << 14)) return 339;
+        else if (n <= (1 << 16)) return 350;
+        else if (n <= (1 << 18)) return 366;
+        else if (n <= (1 << 20)) return 377;
+        else if (n <= (1 << 22)) return 396;
+        else if (n <= (1 << 24)) return 413;
+        else {
+            std::cerr << "No valid band length for OKVS!" << std::endl;
+            exit(-1);
+        }
+    }
+
+    int n_;
+    int d_;
+    int delta_;
+    int L_;
+    
+    PRNG prng_;
+    std::unique_ptr<ELSHFmap> elsh_;
+    
+    std::shared_ptr<SEALContext> context_;
+    SecretKey secret_key_;
+    PublicKey public_key_;
+    std::unique_ptr<Encryptor> encryptor_;
+    std::unique_ptr<Decryptor> decryptor_;
+    std::unique_ptr<Evaluator> evaluator_;
+    
+    std::vector<std::vector<uint8_t>> W_;
+    std::vector<std::set<std::string>> ID_W_;
+    std::vector<block> okvs_encoded_;
+    
+    double offline_time_ = 0.0;
+    double online_time_ = 0.0;
+    CommStats offline_comm_;
+    CommStats online_comm_;
+    
+    // 用于验证
+    std::set<int> matched_sender_indices_;
+    std::vector<std::pair<int, int>> match_pairs_;
+};
+
+int main(int argc, char** argv) {
+    int n = 256;
+    int d = 128;
+    int delta = 10;
+    int L = 32;
+    
+    int port = 12345;
+    
+    if (argc > 1) {
+        port = std::atoi(argv[1]);
+    }
+    
+    std::cout << "========================================" << std::endl;
+    std::cout << "FPSI Protocol - Receiver" << std::endl;
+    std::cout << "========================================" << std::endl;
+    std::cout << "参数配置:" << std::endl;
+    std::cout << "  n (Receiver size) = " << n << std::endl;
+    std::cout << "  d (dimension) = " << d << std::endl;
+    std::cout << "  δ (threshold) = " << delta << std::endl;
+    std::cout << "  L (hash functions) = " << L << std::endl;
+    std::cout << "监听端口: " << port << std::endl;
+    std::cout << "========================================" << std::endl;
+    std::cout << std::endl;
+    
+    try {
+        FPSIReceiver receiver(n, d, delta, L);
+        receiver.generateData();
+        
+        std::cout << "Receiver: 等待 Sender 连接..." << std::endl;
+        
+        osuCrypto::IOService ios;
+        std::string address = "127.0.0.1:" + std::to_string(port);
+        osuCrypto::Session session(ios, address, osuCrypto::SessionMode::Server);
+        osuCrypto::Channel chl = session.addChannel();
+        
+        std::cout << "Receiver: Sender 已连接!" << std::endl;
+        std::cout << std::endl;
+        
+        receiver.runOffline(chl);
+        receiver.runOnline(chl);
+        
+        // 明文验证
+        receiver.verifyWithPlaintext(chl);
+        
+        receiver.printStatistics();
+        
+        std::cout << "\nReceiver: 协议执行完成!" << std::endl;
+        
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        return 1;
+    }
+    
+    return 0;
+}

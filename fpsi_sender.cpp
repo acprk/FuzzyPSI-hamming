@@ -1,0 +1,281 @@
+#include <iostream>
+#include <vector>
+#include <set>
+#include <map>
+#include <memory>
+#include <sstream>
+
+// SEAL 库
+#include <seal/seal.h>
+
+// cryptoTools 库 - 确保正确的头文件顺序
+#include "cryptoTools/Common/Defines.h"
+#include "cryptoTools/Common/block.h"
+#include "cryptoTools/Crypto/PRNG.h"
+
+// 网络库 - 必须在 Defines 之后
+#include "cryptoTools/Network/Channel.h"
+#include "cryptoTools/Network/Session.h"
+#include "cryptoTools/Network/IOService.h"
+
+// 项目头文件
+#include "band_okvs.h"
+#include "elsh.h"
+#include "utils.h"
+
+using namespace osuCrypto;
+using namespace seal;
+
+class FPSISender {
+public:
+    FPSISender(int m, int d, int delta, int L)
+        : m_(m), d_(d), delta_(delta), L_(L) {
+        
+        prng_.SetSeed(block(123456, 789012));
+        elsh_ = std::make_unique<ELSHFmap>(d, delta, L);
+    }
+    
+    void generateData() {
+        std::cout << "Sender: 生成 " << m_ << " 个 " << d_ << " 维向量..." << std::endl;
+        
+        Q_.resize(m_);
+        for (int i = 0; i < m_; ++i) {
+            Q_[i] = utils::generateRandomBinaryVector(d_, prng_);
+        }
+        
+        std::cout << "Sender: 数据生成完成" << std::endl;
+    }
+    
+    void runOffline(osuCrypto::Channel& chl) {
+        std::cout << "\n========== Sender: 离线阶段开始 ==========" << std::endl;
+        
+        Timer timer;
+        timer.start();
+        
+        // Step 1: 计算 E-LSH ID
+        std::cout << "Sender: 计算 E-LSH ID..." << std::endl;
+        ID_Q_ = elsh_->computeIDBatch(Q_);
+        
+        uint64_t id_count = 0;
+        for (const auto& ids : ID_Q_) {
+            id_count += ids.size();
+        }
+        std::cout << "Sender: 生成了 " << id_count << " 个 ID (平均每个向量 " 
+                  << (double)id_count / m_ << " 个 ID)" << std::endl;
+        
+        // Step 2: 接收 OKVS 编码和公钥
+        std::cout << "Sender: 等待接收 Receiver 的 OKVS 编码和公钥..." << std::endl;
+        
+        // 接收 OKVS size
+        uint64_t okvs_size;
+        chl.recv(okvs_size);
+        std::cout << "Sender: OKVS size = " << okvs_size << std::endl;
+        
+        // 接收 OKVS 数据
+        okvs_encoded_.resize(okvs_size);
+        chl.recv(okvs_encoded_.data(), okvs_size);
+        offline_comm_.addReceived(sizeof(uint64_t) + okvs_size * sizeof(block));
+        
+        std::cout << "Sender: OKVS 数据接收完成 (" 
+                  << okvs_size * sizeof(block) / (1024.0 * 1024.0) << " MB)" << std::endl;
+        
+        // 接收公钥
+        std::string pk_str;
+        chl.recv(pk_str);
+        offline_comm_.addReceived(pk_str.size());
+        
+        std::cout << "Sender: 公钥接收完成 (" 
+                  << pk_str.size() / (1024.0 * 1024.0) << " MB)" << std::endl;
+        
+        // 创建 SEAL 上下文和加载公钥
+        std::cout << "Sender: 初始化 SEAL 参数..." << std::endl;
+        EncryptionParameters parms(scheme_type::bfv);
+        size_t poly_modulus_degree = 8192;
+        parms.set_poly_modulus_degree(poly_modulus_degree);
+        parms.set_coeff_modulus(CoeffModulus::BFVDefault(poly_modulus_degree));
+        parms.set_plain_modulus(PlainModulus::Batching(poly_modulus_degree, 20));
+        
+        context_ = std::make_shared<SEALContext>(parms);
+        
+        std::cout << "Sender: 加载公钥..." << std::endl;
+        std::stringstream pk_stream(pk_str);
+        PublicKey public_key;
+        public_key.load(*context_, pk_stream);
+        
+        encryptor_ = std::make_unique<Encryptor>(*context_, public_key);
+        
+        std::cout << "Sender: SEAL 初始化完成" << std::endl;
+        
+        timer.stop();
+        offline_time_ = timer.getElapsedSeconds();
+        
+        std::cout << "Sender: 离线阶段完成" << std::endl;
+        std::cout << "  时间: " << offline_time_ << " 秒" << std::endl;
+        offline_comm_.print("离线");
+    }
+    
+    void runOnline(osuCrypto::Channel& chl) {
+        std::cout << "\n========== Sender: 在线阶段开始 ==========" << std::endl;
+        
+        Timer timer;
+        timer.start();
+        
+        // 发送数据集大小
+        chl.send(m_);
+        int rate_s = L_;  // 每个向量的 ID 数量
+        
+        std::cout << "Sender: 处理 " << m_ << " 个查询向量..." << std::endl;
+        std::cout << "Sender: 每个向量有约 " << rate_s << " 个 ID" << std::endl;
+        
+        int total_sent = 0;
+        
+        for (int j = 0; j < m_; ++j) {
+            if (j % 50 == 0) {
+                std::cout << "Sender: 处理进度 " << j << "/" << m_ << std::endl;
+            }
+            
+            for (const auto& id_str : ID_Q_[j]) {
+                // Step 1: 从 ID 生成 OKVS 查询键
+                std::hash<std::string> hasher;
+                uint64_t hash_val = hasher(id_str);
+                block okvs_key(hash_val, j);
+                
+                // Step 2: 从 OKVS 解码获取对应的编码值
+                // 这里简化处理，实际应该使用 OKVS decode
+                // 在真实实现中需要调用: okvs.Decode(okvs_key, okvs_encoded_)
+                
+                // Step 3: 生成随机 mask
+                std::vector<uint8_t> mask = utils::generateRandomBinaryVector(d_, prng_);
+                
+                // Step 4: 计算 u = mask XOR q_j
+                std::vector<uint8_t> u(d_);
+                for (int k = 0; k < d_; ++k) {
+                    u[k] = mask[k] ^ Q_[j][k];
+                }
+                
+                // Step 5: 发送 u 到 Receiver
+                chl.send(u.data(), d_);
+                online_comm_.addSent(d_);
+                total_sent++;
+            }
+        }
+        
+        std::cout << "Sender: 共发送 " << total_sent << " 个消息" << std::endl;
+        
+        timer.stop();
+        online_time_ = timer.getElapsedSeconds();
+        
+        std::cout << "Sender: 在线阶段完成" << std::endl;
+        std::cout << "  时间: " << online_time_ << " 秒" << std::endl;
+        online_comm_.print("在线");
+    }
+    
+    void printStatistics() {
+        std::cout << "\n========================================" << std::endl;
+        std::cout << "Sender 统计信息" << std::endl;
+        std::cout << "========================================" << std::endl;
+        std::cout << "参数: m=" << m_ << ", d=" << d_ << ", δ=" << delta_ << ", L=" << L_ << std::endl;
+        std::cout << std::endl;
+        
+        std::cout << "离线阶段:" << std::endl;
+        std::cout << "  时间: " << offline_time_ << " 秒" << std::endl;
+        std::cout << "  通信: " << offline_comm_.getTotalMegabytes() << " MB" << std::endl;
+        std::cout << std::endl;
+        
+        std::cout << "在线阶段:" << std::endl;
+        std::cout << "  时间: " << online_time_ << " 秒" << std::endl;
+        std::cout << "  通信: " << online_comm_.getTotalMegabytes() << " MB" << std::endl;
+        std::cout << std::endl;
+        
+        std::cout << "总计:" << std::endl;
+        std::cout << "  时间: " << (offline_time_ + online_time_) << " 秒" << std::endl;
+        std::cout << "  通信: " << (offline_comm_.getTotalMegabytes() + online_comm_.getTotalMegabytes()) 
+                  << " MB" << std::endl;
+        std::cout << "========================================" << std::endl;
+        
+        utils::saveStats("fpsi_stats.txt", "Sender", offline_time_, online_time_,
+                        offline_comm_, online_comm_, m_, d_, delta_);
+    }
+
+private:
+    int m_;
+    int d_;
+    int delta_;
+    int L_;
+    
+    PRNG prng_;
+    std::unique_ptr<ELSHFmap> elsh_;
+    std::shared_ptr<SEALContext> context_;
+    std::unique_ptr<Encryptor> encryptor_;
+    
+    std::vector<std::vector<uint8_t>> Q_;
+    std::vector<std::set<std::string>> ID_Q_;
+    std::vector<block> okvs_encoded_;
+    
+    double offline_time_ = 0.0;
+    double online_time_ = 0.0;
+    CommStats offline_comm_;
+    CommStats online_comm_;
+};
+
+int main(int argc, char** argv) {
+    int m = 1024;
+    int d = 128;
+    int delta = 10;
+    int L = 32;
+    
+    std::string ip = "127.0.0.1";
+    int port = 12345;
+    
+    if (argc > 1) {
+        ip = argv[1];
+    }
+    if (argc > 2) {
+        port = std::atoi(argv[2]);
+    }
+    
+    std::cout << "========================================" << std::endl;
+    std::cout << "FPSI Protocol - Sender" << std::endl;
+    std::cout << "========================================" << std::endl;
+    std::cout << "参数配置:" << std::endl;
+    std::cout << "  m (Sender size) = " << m << std::endl;
+    std::cout << "  d (dimension) = " << d << std::endl;
+    std::cout << "  δ (threshold) = " << delta << std::endl;
+    std::cout << "  L (hash functions) = " << L << std::endl;
+    std::cout << "连接信息:" << std::endl;
+    std::cout << "  IP: " << ip << std::endl;
+    std::cout << "  Port: " << port << std::endl;
+    std::cout << "========================================" << std::endl;
+    std::cout << std::endl;
+    
+    try {
+        FPSISender sender(m, d, delta, L);
+        sender.generateData();
+        
+        std::cout << "Sender: 连接到 Receiver..." << std::endl;
+        
+        // 使用 IOService/Session/Channel
+        // osuCrypto::IOService ios;
+        // osuCrypto::Session session(ios, ip, port, osuCrypto::SessionMode::Client);
+        // osuCrypto::Channel chl = session.addChannel();
+        // Sender 端 - 修改为：
+        osuCrypto::IOService ios;
+        osuCrypto::Session session(ios, ip, (u32)port, osuCrypto::SessionMode::Client);
+        osuCrypto::Channel chl = session.addChannel();
+        
+        std::cout << "Sender: 连接建立成功!" << std::endl;
+        std::cout << std::endl;
+        
+        sender.runOffline(chl);
+        sender.runOnline(chl);
+        sender.printStatistics();
+        
+        std::cout << "\nSender: 协议执行完成!" << std::endl;
+        
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        return 1;
+    }
+    
+    return 0;
+}
