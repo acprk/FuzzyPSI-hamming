@@ -311,10 +311,6 @@ If you use this code, please cite:
 
 MIT License (or your preferred license)
 
-## Contact
-
-For questions or issues, please open an issue on GitHub or contact [your-email].
-
 ---
 
 **Last Updated**: 2025-01-04
